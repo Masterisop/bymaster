@@ -11,9 +11,8 @@ import asyncio
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any
-
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,20 +20,311 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+# ── Paths ────────────────────────────────────────────────────────────────────
+
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIR = BASE_DIR.parent / "frontend"
+
+print("BASE_DIR:", BASE_DIR)
+print("FRONTEND_DIR:", FRONTEND_DIR)
+print("FRONTEND EXISTS:", FRONTEND_DIR.exists())
 
 # ── In-memory state ──────────────────────────────────────────────────────────
 
 connected_clients: dict[str, dict[str, Any]] = {}
-# { client_id: { username, game_name, status, last_seen, pending_commands: [] } }
+# {
+#   client_id: {
+#       username,
+#       game_name,
+#       status,
+#       last_seen,
+#       pending_commands
+#   }
+# }
 
 dashboard_sockets: list[WebSocket] = []
 
-HEARTBEAT_TIMEOUT = 30  # seconds before a client is considered offline
+HEARTBEAT_TIMEOUT = 30  # seconds
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
 
+class RegisterPayload(BaseModel):
+    username: str
+    game_name: str = "Unknown Game"
+
+
+class HeartbeatPayload(BaseModel):
+    client_id: str
+    username: str = ""
+    game_name: str = ""
+
+
+class CommandResult(BaseModel):
+    client_id: str
+    success: bool
+    message: str = ""
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def build_snapshot() -> list[dict]:
+    now = time.time()
+    output = []
+
+    for cid, info in list(connected_clients.items()):
+        age = now - info["last_seen"]
+
+        output.append(
+            {
+                "client_id": cid,
+                "username": info["username"],
+                "game_name": info["game_name"],
+                "status": "online" if age < HEARTBEAT_TIMEOUT else "offline",
+                "last_seen_ago": round(age, 1),
+            }
+        )
+
+    return output
+
+
+async def broadcast_state():
+    snapshot = build_snapshot()
+    dead = []
+
+    for ws in dashboard_sockets:
+        try:
+            await ws.send_json(
+                {
+                    "type": "state",
+                    "clients": snapshot,
+                }
+            )
+        except Exception:
+            dead.append(ws)
+
+    for ws in dead:
+        if ws in dashboard_sockets:
+            dashboard_sockets.remove(ws)
+
+
+async def cleanup_loop():
+    while True:
+        await asyncio.sleep(10)
+
+        now = time.time()
+        stale = []
+
+        for cid, info in list(connected_clients.items()):
+            if now - info["last_seen"] > HEARTBEAT_TIMEOUT * 3:
+                stale.append(cid)
+
+        for cid in stale:
+            del connected_clients[cid]
+
+        if stale:
+            await broadcast_state()
+
+
+# ── Lifespan ─────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(cleanup_loop())
+    yield
+    task.cancel()
+
+
+# ── App ──────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="Roblox Join Coordinator",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── Roblox Client API ────────────────────────────────────────────────────────
+
+@app.post("/api/register")
+async def register(payload: RegisterPayload):
+    client_id = str(uuid.uuid4())[:8]
+
+    connected_clients[client_id] = {
+        "username": payload.username,
+        "game_name": payload.game_name,
+        "status": "online",
+        "last_seen": time.time(),
+        "pending_commands": [],
+    }
+
+    await broadcast_state()
+
+    return {
+        "client_id": client_id,
+    }
+
+
+@app.post("/api/heartbeat")
+async def heartbeat(payload: HeartbeatPayload):
+    info = connected_clients.get(payload.client_id)
+
+    if info is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_registered"},
+        )
+
+    info["last_seen"] = time.time()
+
+    if payload.username:
+        info["username"] = payload.username
+
+    if payload.game_name:
+        info["game_name"] = payload.game_name
+
+    commands = list(info["pending_commands"])
+    info["pending_commands"].clear()
+
+    await broadcast_state()
+
+    return {
+        "commands": commands,
+    }
+
+
+@app.post("/api/result")
+async def report_result(payload: CommandResult):
+    for ws in list(dashboard_sockets):
+        try:
+            await ws.send_json(
+                {
+                    "type": "result",
+                    "client_id": payload.client_id,
+                    "success": payload.success,
+                    "message": payload.message,
+                }
+            )
+        except Exception:
+            pass
+
+    return {"ok": True}
+
+
+@app.post("/api/disconnect")
+async def disconnect(payload: HeartbeatPayload):
+    connected_clients.pop(payload.client_id, None)
+
+    await broadcast_state()
+
+    return {"ok": True}
+
+
+# ── Dashboard API ────────────────────────────────────────────────────────────
+
+@app.get("/api/clients")
+async def list_clients():
+    return {
+        "clients": build_snapshot(),
+    }
+
+
+@app.post("/api/join")
+async def trigger_join():
+    now = time.time()
+    count = 0
+
+    for info in connected_clients.values():
+        if now - info["last_seen"] < HEARTBEAT_TIMEOUT:
+            info["pending_commands"].append(
+                {
+                    "action": "join",
+                }
+            )
+            count += 1
+
+    for ws in list(dashboard_sockets):
+        try:
+            await ws.send_json(
+                {
+                    "type": "join_sent",
+                    "count": count,
+                }
+            )
+        except Exception:
+            pass
+
+    return {
+        "sent_to": count,
+    }
+
+
+# ── Dashboard WebSocket ──────────────────────────────────────────────────────
+
+@app.websocket("/ws/dashboard")
+async def dashboard_ws(ws: WebSocket):
+    await ws.accept()
+
+    dashboard_sockets.append(ws)
+
+    await ws.send_json(
+        {
+            "type": "state",
+            "clients": build_snapshot(),
+        }
+    )
+
+    try:
+        while True:
+            data = await ws.receive_json()
+
+            if data.get("action") == "join":
+                await trigger_join()
+
+    except WebSocketDisconnect:
+        pass
+
+    finally:
+        if ws in dashboard_sockets:
+            dashboard_sockets.remove(ws)
+
+
+# ── Health ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "clients": len(connected_clients),
+        "frontend_exists": FRONTEND_DIR.exists(),
+        "frontend_path": str(FRONTEND_DIR),
+    }
+
+
+# ── Frontend ─────────────────────────────────────────────────────────────────
+
+if FRONTEND_DIR.exists():
+    app.mount(
+        "/",
+        StaticFiles(
+            directory=str(FRONTEND_DIR),
+            html=True,
+        ),
+        name="frontend",
+    )
+else:
+    @app.get("/")
+    async def frontend_missing():
+        return {
+            "error": "frontend_not_found",
+            "expected_path": str(FRONTEND_DIR),
+        }
 class RegisterPayload(BaseModel):
     username: str
     game_name: str = "Unknown Game"
